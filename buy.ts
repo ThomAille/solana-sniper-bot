@@ -1,12 +1,14 @@
+// @ts-ignore
+
 import {
   Liquidity,
   LIQUIDITY_STATE_LAYOUT_V4,
   LiquidityPoolKeys,
-  LiquidityStateV4,
+  LiquidityStateV4, LiquiditySwapFixedInInstructionParamsV4,
   MARKET_STATE_LAYOUT_V2,
   MARKET_STATE_LAYOUT_V3,
-  MarketStateV3,
-  Token,
+  MarketStateV3, SPL_ACCOUNT_LAYOUT,
+  Token, TokenAccount,
   TokenAmount,
 } from '@raydium-io/raydium-sdk';
 import {
@@ -22,7 +24,7 @@ import {
   KeyedAccountInfo,
   TransactionMessage,
   VersionedTransaction,
-  Commitment,
+  Commitment, Blockhash, BlockhashWithExpiryBlockHeight,
 } from '@solana/web3.js';
 import {
   getAllAccountsV4,
@@ -37,6 +39,7 @@ import pino from 'pino';
 import bs58 from 'bs58';
 import * as fs from 'fs';
 import * as path from 'path';
+import BN from 'bn.js';
 
 const transport = pino.transport({
   targets: [
@@ -86,6 +89,8 @@ export type MinimalTokenAccountData = {
   market?: MinimalMarketLayoutV3;
 };
 
+// @ts-ignore
+//let latestBlockhash: BlockhashWithExpiryBlockHeight = null;
 let existingLiquidityPools: Set<string> = new Set<string>();
 let existingOpenBookMarkets: Set<string> = new Set<string>();
 let existingTokenAccounts: Map<string, MinimalTokenAccountData> = new Map<
@@ -146,12 +151,12 @@ async function init(): Promise<void> {
   );
 
   // get all existing liquidity pools
-  const allLiquidityPools = await getAllAccountsV4(
+  /*const allLiquidityPools = await getAllAccountsV4(
     quoteToken.mint,
   );
   existingLiquidityPools = new Set(
     allLiquidityPools.map((p) => p.id.toString()),
-  );
+  );*/
 
   // get all open-book markets
   const allMarkets = await getAllMarketsV3();
@@ -160,15 +165,9 @@ async function init(): Promise<void> {
   logger.info(
     `Total ${quoteToken.symbol} markets ${existingOpenBookMarkets.size}`,
   );
-  logger.info(
+  /*logger.info(
     `Total ${quoteToken.symbol} pools ${existingLiquidityPools.size}`,
-  );
-
-  const tokenAccounts = await getTokenAccounts(
-    solanaConnection,
-    wallet.publicKey,
-    commitment,
-  );
+  );*/
 
   // check existing wallet for associated token account of quote mint
   const tokenAccounts = await getTokenAccounts(
@@ -198,16 +197,11 @@ async function init(): Promise<void> {
 
   quoteTokenAssociatedAddress = tokenAccount.pubkey;
 
-  // load tokens to snipe
   loadSnipeList();
 }
 
-export async function processRaydiumPool(updatedAccountInfo: KeyedAccountInfo) {
-  let accountData: LiquidityStateV4 | undefined;
+export async function processRaydiumPool(updatedAccountInfo: KeyedAccountInfo, accountData: LiquidityStateV4) {
   try {
-    accountData = LIQUIDITY_STATE_LAYOUT_V4.decode(
-      updatedAccountInfo.accountInfo.data,
-    );
 
     if (!shouldBuy(accountData.baseMint.toString())) {
       return;
@@ -253,6 +247,16 @@ export async function processOpenBookMarket(
   }
 }
 
+/*async function getLatestBlockhash(slot: number): Promise<void> {
+  console.log(slot)
+  if (!latestBlockhash || slot > latestBlockhash.lastValidBlockHeight) {
+    latestBlockhash = await solanaConnection.getLatestBlockhash({
+      commitment: commitment,
+    });
+    console.log(latestBlockhash);
+  }
+}*/
+
 async function buy(
   accountId: PublicKey,
   accountData: LiquidityStateV4,
@@ -262,14 +266,17 @@ async function buy(
   );
 
   if (!tokenAccount) {
+    logger.error(`No token account found for mint: ${accountData.baseMint}`);
     return;
   }
 
+  logger.info(`CreatePoolKeys for ${accountId}`);
   tokenAccount.poolKeys = createPoolKeys(
     accountId,
     accountData,
     tokenAccount.market!,
   );
+  logger.info(`Create Liquidity Pool for ${accountId}`);
   const { innerTransaction, address } = Liquidity.makeSwapFixedInInstruction(
     {
       poolKeys: tokenAccount.poolKeys,
@@ -284,12 +291,102 @@ async function buy(
     tokenAccount.poolKeys.version,
   );
 
+  logger.info(`Get latest blockhash for ${accountId}`);
   const latestBlockhash = await solanaConnection.getLatestBlockhash({
+    commitment: commitment,
+  });
+  logger.info(`Create TransactionMessage for ${accountId}`);
+  const messageV0 = new TransactionMessage({
+    payerKey: wallet.publicKey,
+    recentBlockhash: latestBlockhash.blockhash,
+    instructions: [
+      ComputeBudgetProgram.setComputeUnitLimit({ units: 400000 }),
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 30000 }),
+      createAssociatedTokenAccountIdempotentInstruction(
+        wallet.publicKey,
+        tokenAccount.address,
+        wallet.publicKey,
+        accountData.baseMint,
+      ),
+      ...innerTransaction.instructions,
+    ],
+  }).compileToV0Message();
+  logger.info(`Sign TransactionMessage for ${accountId}`);
+  const transaction = new VersionedTransaction(messageV0);
+  transaction.sign([wallet, ...innerTransaction.signers]);
+  logger.info(`Send TransactionMessage for ${accountId}`);
+  const signature = await solanaConnection.sendRawTransaction(
+    transaction.serialize(),
+    {
+      maxRetries: 20,
+      preflightCommitment: commitment,
+    },
+  );
+  logger.info(
+    {
+      mint: accountData.baseMint,
+      url: `https://solscan.io/tx/${signature}?cluster=${network}`,
+    },
+    'Buy',
+  );
+
+  setTimeout(() => sell(tokenAccount, accountData), 50000);
+
+}
+
+async function fetchAndParseTokenAccounts(tokenPubKey: string) {
+  const tokenAccountsResp = await solanaConnection.getTokenAccountsByOwner(
+    wallet.publicKey,
+    { programId: TOKEN_PROGRAM_ID },
+    commitment,
+  );
+
+  const filteredTokenAccounts: TokenAccount[] = [];
+  for (const { pubkey, account } of tokenAccountsResp.value) {
+    const decodedData = SPL_ACCOUNT_LAYOUT.decode(account.data);
+    if(decodedData.mint.toString() === tokenPubKey){
+      filteredTokenAccounts.push({
+        pubkey,
+        programId: account.owner,
+        accountInfo: decodedData,
+      });
+    }
+  }
+  return filteredTokenAccounts;
+}
+
+async function sell(tokenAccount: MinimalTokenAccountData, accountData: LiquidityStateV4): Promise<void> {
+
+  if (!tokenAccount.poolKeys) {
+    throw new Error("poolKeys is undefined");
+  }
+
+  const tokenAmount = await fetchAndParseTokenAccounts(accountData.baseMint.toString());
+
+  if (tokenAmount.length === 0) {
+    logger.warn(`No token accounts found for mint: ${accountData.baseMint}`);
+    return;
+  }
+
+  const { innerTransaction, address } = Liquidity.makeSwapFixedInInstruction(
+    {
+      poolKeys: tokenAccount.poolKeys,
+      userKeys: {
+        tokenAccountIn: tokenAccount.address,
+        tokenAccountOut: quoteTokenAssociatedAddress,
+        owner: wallet.publicKey,
+      },
+      amountIn: new BN(tokenAmount[0].accountInfo.amount),
+      minAmountOut: 0,
+    },
+    tokenAccount.poolKeys.version,
+  );
+  const sellLatestBlockhash = await solanaConnection.getLatestBlockhash({
     commitment: commitment,
   });
   const messageV0 = new TransactionMessage({
     payerKey: wallet.publicKey,
-    recentBlockhash: latestBlockhash.blockhash,
+    recentBlockhash: sellLatestBlockhash.blockhash,
     instructions: [
       ComputeBudgetProgram.setComputeUnitLimit({ units: 400000 }),
       ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 30000 }),
@@ -311,12 +408,12 @@ async function buy(
       preflightCommitment: commitment,
     },
   );
-  logger.info(
+  logger.warn(
     {
       mint: accountData.baseMint,
       url: `https://solscan.io/tx/${signature}?cluster=${network}`,
     },
-    'Buy',
+    'Sell',
   );
 }
 
@@ -345,12 +442,25 @@ const runListener = async () => {
   await init();
   const raydiumSubscriptionId = solanaConnection.onProgramAccountChange(
     RAYDIUM_LIQUIDITY_PROGRAM_ID_V4,
-    async (updatedAccountInfo) => {
+    async (updatedAccountInfo: KeyedAccountInfo) => {
       const key = updatedAccountInfo.accountId.toString();
-      const existing = existingLiquidityPools.has(key);
-      if (!existing) {
-        existingLiquidityPools.add(key);
-        const _ = processRaydiumPool(updatedAccountInfo);
+      let accountData: LiquidityStateV4 | undefined;
+      try {
+        accountData = LIQUIDITY_STATE_LAYOUT_V4.decode(
+          updatedAccountInfo.accountInfo.data,
+        );
+        const runTimestamp = Math.floor(new Date().getTime() / 1000);
+
+        const poolOpenTime = parseInt(accountData.poolOpenTime.toString());
+        const existing = existingLiquidityPools.has(key);
+        //getLatestBlockhash()
+        if (poolOpenTime === runTimestamp && !existing) {
+          logger.info(`New pool detected: ${accountData.baseMint.toString()}`);
+          existingLiquidityPools.add(key);
+          const _ = buy(updatedAccountInfo.accountId, accountData);
+        }
+      } catch (e) {
+        logger.error({ ...accountData, error: e }, `Failed to process pool`);
       }
     },
     commitment,
@@ -398,6 +508,10 @@ const runListener = async () => {
       },
     ],
   );
+
+  /*const slot = solanaConnection.onSlotChange(async (slot) => {
+    await getLatestBlockhash(slot.slot);
+  });*/
 
   logger.info(`Listening for raydium changes: ${raydiumSubscriptionId}`);
   logger.info(`Listening for open book changes: ${openBookSubscriptionId}`);
